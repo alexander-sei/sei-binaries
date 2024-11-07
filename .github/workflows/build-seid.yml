@@ -1,4 +1,4 @@
-name: Build seid Binary
+name: Build and Release seid and price-feeder
 
 on:
   push:
@@ -10,63 +10,14 @@ on:
         description: 'Comma-separated list of versions to build'
         required: false
 
+env:
+    REPO: ${{ github.repository }}
+
 permissions:
   contents: write
 
 jobs:
-  read-releases:
-    runs-on: ubuntu-latest
-    outputs:
-      versions: ${{ steps.read_versions.outputs.versions }}
-      new_releases: ${{ steps.create_releases_if_needed.outputs.new_releases }}
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Authenticate GitHub CLI
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
-
-      - name: Read Versions
-        id: read_versions
-        shell: bash
-        run: |
-          if [ -n "${{ github.event.inputs.versions }}" ]; then
-            echo "Using versions from workflow input."
-            VERSIONS="${{ github.event.inputs.versions }}"
-          elif [ -f versions.txt ]; then
-            echo "Using versions from versions.txt."
-            VERSIONS=$(cat versions.txt | tr '\n' ',')
-          else
-            echo "Fetching the latest tag from GitHub."
-            LATEST_TAG=$(gh api repos/sei-protocol/sei-chain/releases/latest --jq .tag_name)
-            VERSIONS=$LATEST_TAG
-          fi
-          echo "versions=$VERSIONS" >> $GITHUB_OUTPUT
-
-      - name: Create Releases if Needed
-        id: create_releases_if_needed
-        shell: bash
-        run: |
-          NEW_RELEASES=""
-          for VERSION in $(echo "${{ steps.read_versions.outputs.versions }}" | tr ',' ' '); do
-            # Check if release exists in the current repo; if not, add it to build pipeline.
-            if ! gh release view $VERSION &>/dev/null; then
-              # Add to NEW_RELEASES
-              if [ -z "$NEW_RELEASES" ]; then
-                NEW_RELEASES="$VERSION"
-              else
-                NEW_RELEASES="$NEW_RELEASES,$VERSION"
-              fi
-            else
-              echo "Release $VERSION already exists."
-              exit 1
-            fi
-          done
-          echo "new_releases=$NEW_RELEASES" >> $GITHUB_OUTPUT
-
-  build-seid:
-    needs: read-releases
-    if: needs.read-releases.outputs.new_releases != ''
+  build-and-release:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -81,6 +32,11 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Ensure all tags are fetched
+
+      - name: Authenticate GitHub CLI
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
 
       - name: Set up Go 1.21
         uses: actions/setup-go@v5
@@ -91,18 +47,44 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential
+          sudo apt-get install -y build-essential fakeroot dpkg-dev
 
-      - name: Build seid Binary for Each Version
+      - name: Read Versions
+        id: read_versions
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.versions }}" ]; then
+            echo "Using versions from workflow input."
+            VERSIONS="${{ github.event.inputs.versions }}"
+          elif [ -f versions.txt ]; then
+            echo "Using versions from versions.txt."
+            VERSIONS=$(cat versions.txt | tr '\n' ',')
+          else
+            echo "Fetching the latest tag from git."
+            git fetch --tags
+            LATEST_TAG=$(git describe --tags $(git rev-list --tags --max-count=1))
+            VERSIONS=$LATEST_TAG
+          fi
+          echo "versions=$VERSIONS" >> $GITHUB_OUTPUT
+
+      - name: Build and Upload Binaries
         shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          set -e  # Exit immediately if a command exits with a non-zero status
+          set -e
           mkdir -p binaries
-          for VERSION in $(echo "${{ needs.read-releases.outputs.new_releases }}" | tr ',' ' '); do
-            echo "Building seid version $VERSION for $GOOS/$GOARCH"
+          for VERSION in $(echo "${{ steps.read_versions.outputs.versions }}" | tr ',' ' '); do
+            echo "Processing version $VERSION for $GOOS/$GOARCH"
+
+            # Check if release exists
+            if gh release view $VERSION &>/dev/null; then
+              echo "Release $VERSION already exists."
+              continue
+            fi
+
+            # Clone and checkout the specified version
             git clone https://github.com/sei-protocol/sei-chain.git sei-chain-$VERSION
             cd sei-chain-$VERSION
             git checkout tags/$VERSION
@@ -121,9 +103,6 @@ jobs:
             elif [[ "$GOOS" == "darwin" ]]; then
               LIBWASMVM_FILENAME="libwasmvmstatic_darwin.a"
               RENAMED_LIBWASMVM="libwasmvm.a"
-            elif [[ "$GOOS" == "windows" ]]; then
-              LIBWASMVM_FILENAME="wasmvm.lib"
-              RENAMED_LIBWASMVM="wasmvm.lib"
             else
               echo "Unsupported GOOS: $GOOS"
               exit 1
@@ -133,15 +112,10 @@ jobs:
             echo "Downloading static libwasmvm from $LIBWASMVM_URL"
             curl -L -o $LIBWASMVM_FILENAME $LIBWASMVM_URL
 
-            # Create lib directory and rename the library appropriately
+            # Create lib directory and move the library
             mkdir -p lib
-            if [[ "$GOOS" == "linux" || "$GOOS" == "darwin" ]]; then
-              mv $LIBWASMVM_FILENAME lib/$RENAMED_LIBWASMVM
-            elif [[ "$GOOS" == "windows" ]]; then
-              mv $LIBWASMVM_FILENAME lib/$RENAMED_LIBWASMVM
-            fi
+            mv $LIBWASMVM_FILENAME lib/$RENAMED_LIBWASMVM
 
-            # Verify that the library has been moved and renamed correctly
             if [[ ! -f lib/$RENAMED_LIBWASMVM ]]; then
               echo "Failed to locate the renamed wasmvm library."
               exit 1
@@ -151,196 +125,118 @@ jobs:
             export CGO_ENABLED=1
             export CGO_CFLAGS="-I$PWD/lib"
             export CGO_LDFLAGS="-L$PWD/lib -lwasmvm -lm"
-
-            # Optionally, disable dynamic linking (adjust as needed)
             export CGO_LDFLAGS_ALLOW="-Wl,-rpath=.*"
 
-            # Build the binary with static linking
+            # Build seid binary
             GOOS=$GOOS GOARCH=$GOARCH make build
+
+            # Build price-feeder binary
+            echo "Building price-feeder"
+            GOOS=$GOOS GOARCH=$GOARCH go build -o ./build/price-feeder ./oracle/price-feeder
 
             cd ..
 
-            # Copy the binary to the artifacts directory
+            # Copy binaries to a temporary directory
+            mkdir temp_binaries
+
             if [[ "$GOOS" == "windows" ]]; then
-              cp "sei-chain-$VERSION/build/seid.exe" "binaries/seid-${VERSION}-${GOOS}-${GOARCH}.exe"
+              cp "sei-chain-$VERSION/build/seid.exe" "temp_binaries/seid-${VERSION}-${GOOS}-${GOARCH}.exe"
+              cp "sei-chain-$VERSION/build/price-feeder.exe" "temp_binaries/price-feeder-${VERSION}-${GOOS}-${GOARCH}.exe"
             else
-              cp "sei-chain-$VERSION/build/seid" "binaries/seid-${VERSION}-${GOOS}-${GOARCH}"
+              cp "sei-chain-$VERSION/build/seid" "temp_binaries/seid-${VERSION}-${GOOS}-${GOARCH}"
+              cp "sei-chain-$VERSION/build/price-feeder" "temp_binaries/price-feeder-${VERSION}-${GOOS}-${GOARCH}"
             fi
-          done
 
-      - name: Compute Checksums
-        shell: bash
-        run: |
-          cd binaries
-          for FILE in *; do
-            # Compute SHA256 checksum
-            if [[ "$RUNNER_OS" == "Windows" ]]; then
-              CHECKSUM=$(CertUtil -hashfile "$FILE" SHA256 | findstr /v "hash of file" | findstr /v "CertUtil" | tr -d ' \r\n')
-            elif [[ "$RUNNER_OS" == "macOS" ]]; then
-              CHECKSUM=$(shasum -a 256 "$FILE" | awk '{ print $1 }')
+            # Package into .deb if on Linux
+            if [[ "$GOOS" == "linux" ]]; then
+              echo "Packaging binaries into .deb package"
+
+              # Create package directory structure
+              mkdir -p deb_pkg/DEBIAN
+              mkdir -p deb_pkg/usr/local/bin
+
+              # Copy binaries
+              cp sei-chain-$VERSION/build/seid deb_pkg/usr/local/bin/
+
+              # Create control file using printf
+              printf "Package: seid\nVersion: ${VERSION#v}\nSection: base\nPriority: optional\nArchitecture: ${GOARCH}\nDepends: libc6 (>= 2.7)\nMaintainer: Alexander-sei <alexander@seifdn.org>\nDescription: Sei Chain binaries (seid)\n" > deb_pkg/DEBIAN/control
+
+              # Build the .deb package
+              dpkg-deb --build deb_pkg "seid-${VERSION}-${GOARCH}.deb"
+
+              # Move the .deb package to temp_binaries
+              mv "seid-${VERSION}-${GOARCH}.deb" temp_binaries
+
+              # Clean up packaging directory
+              rm -rf deb_pkg
+            fi
+
+            # Prepare the release
+
+            if gh release view $VERSION &> /dev/null; then
+                echo "Release $VERSION already exists."
             else
-              CHECKSUM=$(sha256sum "$FILE" | awk '{ print $1 }')
+                # Try to get tag message as release body
+                RELEASE_BODY=$(git tag -l --format="%(contents)" $VERSION)
+                # If tag message is empty, set default release body
+                if [ -z "$RELEASE_BODY" ]; then
+                    RELEASE_BODY="Release $VERSION"
+                fi
+                RELEASE_BODY="${RELEASE_BODY//$'\r'/}"
+                # Update release notes with checksums
+                echo -e "$RELEASE_BODY" > release_body.txt
+                # Append the note about source code archives
+                echo -e "\n\n**Note:** The default 'Source code (zip)' and 'Source code (tar.gz)' archives generated by GitHub are not useful. Please use the attached 'sei-chain-$VERSION.zip' and 'sei-chain-$VERSION.tar.gz' files from the original 'sei-chain' repository." >> release_body.txt
+                # Append the SHA256 Checksums header
+                echo -e "\n\n**SHA256 Checksums:**\n" >> release_body.txt
+                gh release create $VERSION --notes-file release_body.txt
+                # Upload source code archives
+                ZIP_URL="https://github.com/sei-protocol/sei-chain/archive/refs/tags/$VERSION.zip"
+                TAR_GZ_URL="https://github.com/sei-protocol/sei-chain/archive/refs/tags/$VERSION.tar.gz"
+                curl -L -o "sei-chain-$VERSION.zip" "$ZIP_URL"
+                curl -L -o "sei-chain-$VERSION.tar.gz" "$TAR_GZ_URL"
+                gh release upload $VERSION "sei-chain-$VERSION.zip#sei-chain-$VERSION.zip"
+                gh release upload $VERSION "sei-chain-$VERSION.tar.gz#sei-chain-$VERSION.tar.gz"
             fi
-            # Save checksum to .sha256 file
-            echo "$CHECKSUM  $FILE" > "$FILE.sha256"
-            # Save checksum info for release notes
-            echo "$FILE: $CHECKSUM" >> "../checksum_info_${FILE}.txt"
-          done
-          cd ..
 
-      - name: Upload Binaries as Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: binaries/*
-
-      - name: Upload Checksum Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: checksums-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: checksum_info_*.txt
-
-  create-releases:
-    runs-on: ubuntu-latest
-    needs: build-seid
-    outputs:
-      new_releases: ${{ steps.create_releases_if_needed.outputs.new_releases }}
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Authenticate GitHub CLI
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
-
-      - name: Read Versions
-        id: read_versions
-        shell: bash
-        run: |
-          if [ -n "${{ github.event.inputs.versions }}" ]; then
-            echo "Using versions from workflow input."
-            VERSIONS="${{ github.event.inputs.versions }}"
-          elif [ -f versions.txt ]; then
-            echo "Using versions from versions.txt."
-            VERSIONS=$(cat versions.txt | tr '\n' ',')
-          else
-            echo "Fetching the latest tag from GitHub."
-            LATEST_TAG=$(gh api repos/sei-protocol/sei-chain/releases/latest --jq .tag_name)
-            VERSIONS=$LATEST_TAG
-          fi
-          echo "versions=$VERSIONS" >> $GITHUB_OUTPUT
-
-      - name: Create Releases if Needed
-        id: create_releases_if_needed
-        shell: bash
-        run: |
-          NEW_RELEASES=""
-          for VERSION in $(echo "${{ steps.read_versions.outputs.versions }}" | tr ',' ' '); do
-            # Fetch release description from the original repo
-            RELEASE_BODY=$(gh api repos/sei-protocol/sei-chain/releases/tags/$VERSION --jq .body)
-            RELEASE_BODY="${RELEASE_BODY//$'\r'/}"  # Remove any carriage returns
-            # Check if release exists in the current repo; if not, create it
-            if ! gh release view $VERSION &>/dev/null; then
-              echo "Release $VERSION does not exist. Creating it."
-              gh release create $VERSION --notes "$RELEASE_BODY"
-              # Download source code archives from sei-chain repo
-              ZIP_URL="https://github.com/sei-protocol/sei-chain/archive/refs/tags/$VERSION.zip"
-              TAR_GZ_URL="https://github.com/sei-protocol/sei-chain/archive/refs/tags/$VERSION.tar.gz"
-              curl -L -o "sei-chain-$VERSION.zip" "$ZIP_URL"
-              curl -L -o "sei-chain-$VERSION.tar.gz" "$TAR_GZ_URL"
-              # Upload source code archives to the release with custom labels
-              gh release upload $VERSION "sei-chain-$VERSION.zip#sei-chain-$VERSION.zip"
-              gh release upload $VERSION "sei-chain-$VERSION.tar.gz#sei-chain-$VERSION.tar.gz"
-              # Add to NEW_RELEASES
-              if [ -z "$NEW_RELEASES" ]; then
-                NEW_RELEASES="$VERSION"
+            # Compute checksums and upload binaries
+            cd temp_binaries
+            for FILE in *; do
+              if [[ "$RUNNER_OS" == "Windows" ]]; then
+                CHECKSUM=$(CertUtil -hashfile "$FILE" SHA256 | findstr /v "hash of file" | findstr /v "CertUtil" | tr -d ' \r\n')
+              elif [[ "$RUNNER_OS" == "macOS" ]]; then
+                CHECKSUM=$(shasum -a 256 "$FILE" | awk '{ print $1 }')
               else
-                NEW_RELEASES="$NEW_RELEASES,$VERSION"
+                CHECKSUM=$(sha256sum "$FILE" | awk '{ print $1 }')
               fi
+
+              echo "$CHECKSUM  $FILE" > "$FILE.sha256"
+              echo "$FILE: $CHECKSUM" >> "../checksum_info.txt"
+
+              # Upload binary and checksum to the release
+              gh release upload $VERSION "$FILE"
+              gh release upload $VERSION "$FILE.sha256"
+            done
+
+            cd ..
+
+            # Update release notes with checksums
+            rm -rf release_body.txt
+            # Get the current release body
+            if RELEASE_BODY=$(gh release view $VERSION --json body --jq .body); then
+              echo "$RELEASE_BODY" > release_body.txt
             else
-              echo "Release $VERSION already exists."
+              RELEASE_BODY="Release $VERSION"
+              echo "$RELEASE_BODY" > release_body.txt
             fi
-          done
-          echo "new_releases=$NEW_RELEASES" >> $GITHUB_OUTPUT
-
-      - name: Download Checksum Artifacts
-        if: ${{ steps.create_releases_if_needed.outputs.new_releases != '' }}
-        uses: actions/download-artifact@v4
-        with:
-          path: ./checksums
-
-      - name: Concatenate Checksums per Version
-        if: ${{ steps.create_releases_if_needed.outputs.new_releases != '' }}
-        shell: bash
-        run: |
-          for VERSION in $(echo "${{ steps.create_releases_if_needed.outputs.new_releases }}" | tr ',' ' '); do
-            # Find and concatenate all checksum files for the current version
-            find ./checksums -name "checksum_info_seid-${VERSION}-*" -exec cat {} + >> all_checksums_$VERSION.txt
-          done
-
-      - name: Update Release Notes
-        if: ${{ steps.create_releases_if_needed.outputs.new_releases != '' }}
-        shell: bash
-        run: |
-          for VERSION in $(echo "${{ steps.create_releases_if_needed.outputs.new_releases }}" | tr ',' ' '); do
-            # Fetch existing release notes and save to file
-            gh release view $VERSION --json body --template '{{.body}}' > release_body.txt
-            # Append the note about source code archives
-            echo -e "\n\n**Note:** The default 'Source code (zip)' and 'Source code (tar.gz)' archives generated by GitHub are not useful. Please use the attached 'sei-chain-$VERSION.zip' and 'sei-chain-$VERSION.tar.gz' files from the original 'sei-chain' repository." >> release_body.txt
-            # Append the checksums for this version
-            echo -e "\n\n**SHA256 Checksums:**\n" >> release_body.txt
-            cat all_checksums_$VERSION.txt | while read line; do
+            # Append checksums to release body
+            cat "checksum_info.txt" | while read line; do
                 echo "\`\`\`${line}\`\`\`" >> release_body.txt
             done
-            # Update the release notes
+
             gh release edit $VERSION --notes-file release_body.txt
-          done
 
-  upload-binaries:
-    needs: [build-seid, create-releases]
-    if: needs.create-releases.outputs.new_releases != ''
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
+            # Clean up temporary files
+            rm -rf sei-chain-$VERSION temp_binaries release_body.txt checksum_info.txt
 
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Authenticate GitHub CLI
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
-
-      - name: Download Binary Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: ./binaries
-
-      - name: Upload Binaries and Checksums to Releases
-        shell: bash
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          for VERSION in $(echo "${{ needs.create-releases.outputs.new_releases }}" | tr ',' ' '); do
-            echo "Uploading binaries for $VERSION, GOOS=$GOOS, GOARCH=$GOARCH"
-            if [[ "$GOOS" == "windows" ]]; then
-              FILE="binaries/seid-${VERSION}-${GOOS}-${GOARCH}.exe"
-            else
-              FILE="binaries/seid-${VERSION}-${GOOS}-${GOARCH}"
-            fi
-            if [ -f "$FILE" ]; then
-              echo "Uploading $FILE to release $VERSION"
-              gh release upload $VERSION "$FILE"
-              # Also upload the .sha256 file if it exists
-              if [ -f "$FILE.sha256" ]; then
-                gh release upload $VERSION "$FILE.sha256"
-              fi
-            else
-              echo "File $FILE does not exist"
-            fi
           done
