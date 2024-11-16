@@ -11,7 +11,7 @@ on:
         required: false
 
 env:
-    REPO: ${{ github.repository }}
+  REPO: ${{ github.repository }}
 
 permissions:
   contents: write
@@ -22,9 +22,12 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             goos: linux
             goarch: amd64
+          - os: ubuntu-22.04
+            goos: linux
+            goarch: arm64
           - os: macos-latest
             goos: darwin
             goarch: arm64
@@ -48,6 +51,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential fakeroot dpkg-dev
+          if [ "${{ matrix.goarch }}" = "arm64" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          fi
+
+      - name: Verify Cross-Compiler Installation
+        if: runner.os == 'Linux' && matrix.goarch == 'arm64'
+        run: |
+          which aarch64-linux-gnu-gcc || echo "aarch64-linux-gnu-gcc not found in PATH"
+          aarch64-linux-gnu-gcc --version || echo "Unable to execute aarch64-linux-gnu-gcc"
+          ls /usr/bin/aarch64-linux-gnu-gcc* || echo "Compiler binaries not found"
 
       - name: Read Versions
         id: read_versions
@@ -98,25 +111,30 @@ jobs:
 
             # Determine the appropriate static libwasmvm binary filename
             if [[ "$GOOS" == "linux" ]]; then
-              LIBWASMVM_FILENAME="libwasmvm_muslc.x86_64.a"
-              RENAMED_LIBWASMVM="libwasmvm.a"
+              if [[ "$GOARCH" == "amd64" ]]; then
+                LIBWASMVM_FILENAME="libwasmvm_muslc.x86_64.a"
+              elif [[ "$GOARCH" == "arm64" ]]; then
+                LIBWASMVM_FILENAME="libwasmvm_muslc.aarch64.a"
+              else
+                echo "Unsupported GOARCH: $GOARCH for GOOS: $GOOS"
+                exit 1
+              fi
             elif [[ "$GOOS" == "darwin" ]]; then
               LIBWASMVM_FILENAME="libwasmvmstatic_darwin.a"
-              RENAMED_LIBWASMVM="libwasmvm.a"
             else
               echo "Unsupported GOOS: $GOOS"
               exit 1
             fi
-
+            
             LIBWASMVM_URL="https://github.com/CosmWasm/wasmvm/releases/download/$WASMVM_VERSION/$LIBWASMVM_FILENAME"
             echo "Downloading static libwasmvm from $LIBWASMVM_URL"
             curl -L -o $LIBWASMVM_FILENAME $LIBWASMVM_URL
 
             # Create lib directory and move the library
             mkdir -p lib
-            mv $LIBWASMVM_FILENAME lib/$RENAMED_LIBWASMVM
+            mv $LIBWASMVM_FILENAME lib/libwasmvm.a
 
-            if [[ ! -f lib/$RENAMED_LIBWASMVM ]]; then
+            if [[ ! -f lib/libwasmvm.a ]]; then
               echo "Failed to locate the renamed wasmvm library."
               exit 1
             fi
@@ -126,6 +144,12 @@ jobs:
             export CGO_CFLAGS="-I$PWD/lib"
             export CGO_LDFLAGS="-L$PWD/lib -lwasmvm -lm"
             export CGO_LDFLAGS_ALLOW="-Wl,-rpath=.*"
+
+            # Set CC and CXX for cross-compilation if necessary
+            if [[ "$GOOS" == "linux" ]] && [[ "$GOARCH" == "arm64" ]]; then
+              export CC=aarch64-linux-gnu-gcc
+              export CXX=aarch64-linux-gnu-g++
+            fi
 
             # Build seid binary
             GOOS=$GOOS GOARCH=$GOARCH make build
