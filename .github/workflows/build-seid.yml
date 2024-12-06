@@ -1,14 +1,9 @@
-name: Build and Release seid and price-feeder
+name: Build and Release seid and price-feeder with Pebble
 
 on:
   push:
     branches:
       - main
-  workflow_dispatch:
-    inputs:
-      versions:
-        description: 'Comma-separated list of versions to build'
-        required: false
 
 env:
   REPO: ${{ github.repository }}
@@ -66,19 +61,16 @@ jobs:
         id: read_versions
         shell: bash
         run: |
-          if [ -n "${{ github.event.inputs.versions }}" ]; then
-            echo "Using versions from workflow input."
-            VERSIONS="${{ github.event.inputs.versions }}"
-          elif [ -f versions.txt ]; then
-            echo "Using versions from versions.txt."
-            VERSIONS=$(cat versions.txt | tr '\n' ',')
+          if [ -f version.txt ]; then
+            echo "Using version from version.txt."
+            VERSION=$(cat version.txt | tr '\n' ',')
           else
             echo "Fetching the latest tag from git."
             git fetch --tags
             LATEST_TAG=$(git describe --tags $(git rev-list --tags --max-count=1))
-            VERSIONS=$LATEST_TAG
+            VERSION=$LATEST_TAG
           fi
-          echo "versions=$VERSIONS" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Build and Upload Binaries
         shell: bash
@@ -88,7 +80,7 @@ jobs:
         run: |
           set -e
           mkdir -p binaries
-          for VERSION in $(echo "${{ steps.read_versions.outputs.versions }}" | tr ',' ' '); do
+          for VERSION in $(echo "${{ steps.read_versions.outputs.version }}" | tr ',' ' '); do
             echo "Processing version $VERSION for $GOOS/$GOARCH"
 
             # Check if release exists
@@ -125,7 +117,7 @@ jobs:
               echo "Unsupported GOOS: $GOOS"
               exit 1
             fi
-            
+
             LIBWASMVM_URL="https://github.com/CosmWasm/wasmvm/releases/download/$WASMVM_VERSION/$LIBWASMVM_FILENAME"
             echo "Downloading static libwasmvm from $LIBWASMVM_URL"
             curl -L -o $LIBWASMVM_FILENAME $LIBWASMVM_URL
@@ -151,7 +143,8 @@ jobs:
               export CXX=aarch64-linux-gnu-g++
             fi
 
-            # Build seid binary
+            # Build seid binary (normal version)
+            echo "Building seid (normal version)"
             GOOS=$GOOS GOARCH=$GOARCH make build
 
             # Build price-feeder binary
@@ -161,15 +154,33 @@ jobs:
             cd ..
 
             # Copy binaries to a temporary directory
-            mkdir temp_binaries
+            mkdir -p temp_binaries
 
-            if [[ "$GOOS" == "windows" ]]; then
-              cp "sei-chain-$VERSION/build/seid.exe" "temp_binaries/seid-${VERSION}-${GOOS}-${GOARCH}.exe"
-              cp "sei-chain-$VERSION/build/price-feeder.exe" "temp_binaries/price-feeder-${VERSION}-${GOOS}-${GOARCH}.exe"
-            else
-              cp "sei-chain-$VERSION/build/seid" "temp_binaries/seid-${VERSION}-${GOOS}-${GOARCH}"
-              cp "sei-chain-$VERSION/build/price-feeder" "temp_binaries/price-feeder-${VERSION}-${GOOS}-${GOARCH}"
-            fi
+            cp "sei-chain-$VERSION/build/seid" "temp_binaries/seid-${VERSION}-${GOOS}-${GOARCH}"
+            cp "sei-chain-$VERSION/build/price-feeder" "temp_binaries/price-feeder-${VERSION}-${GOOS}-${GOARCH}"
+
+            # Build Pebble version of seid
+            echo "Building seid (Pebble version)"
+            cp -r sei-chain-$VERSION sei-chain-$VERSION-pebble
+            cd sei-chain-$VERSION-pebble
+
+            # Modify go.mod for Pebble
+            go mod edit -replace github.com/tendermint/tm-db=github.com/Bro-chain/tm-db@pebble
+            go mod tidy
+
+            # Set variables for Pebble build
+            PEBBLE_SEARCH="-X github.com/cosmos/cosmos-sdk/version.Version=\\\$(VERSION)"
+            PEBBLE_REPLACE="-X github.com/cosmos/cosmos-sdk/types.DBBackend=pebbledb -X github.com/tendermint/tm-db.ForceSync=1"
+
+            # Modify Makefile for Pebble
+            sed -i.bak -e "s|${PEBBLE_SEARCH}|${PEBBLE_SEARCH} ${PEBBLE_REPLACE}|" Makefile
+
+            # Build seid with Pebble support
+            GOOS=$GOOS GOARCH=$GOARCH make build -B TENDERMINT_BUILD_OPTIONS=pebbledb BUILD_TAGS=pebbledb
+
+            cd ..
+
+            cp "sei-chain-$VERSION-pebble/build/seid" "temp_binaries/seid-pebble-${VERSION}-${GOOS}-${GOARCH}"
 
             # Package into .deb if on Linux
             if [[ "$GOOS" == "linux" ]]; then
@@ -179,10 +190,10 @@ jobs:
               mkdir -p deb_pkg/DEBIAN
               mkdir -p deb_pkg/usr/local/bin
 
-              # Copy binaries
+              # Copy normal seid binary
               cp sei-chain-$VERSION/build/seid deb_pkg/usr/local/bin/
 
-              # Create control file using printf
+              # Create control file
               printf "Package: seid\nVersion: ${VERSION#v}\nSection: base\nPriority: optional\nArchitecture: ${GOARCH}\nDepends: libc6 (>= 2.7)\nMaintainer: Alexander-sei <alexander@seifdn.org>\nDescription: Sei Chain binaries (seid)\n" > deb_pkg/DEBIAN/control
 
               # Build the .deb package
@@ -195,40 +206,69 @@ jobs:
               rm -rf deb_pkg
             fi
 
-            # Prepare the release
+            # Package into .deb if on Linux
+            if [[ "$GOOS" == "linux" ]]; then
+              echo "Packaging Pebble binaries into .deb package"
 
+              # Create package directory structure
+              mkdir -p pebble_deb_pkg/DEBIAN
+              mkdir -p pebble_deb_pkg/usr/local/bin
+
+              # Copy Pebble seid binary
+              cp sei-chain-$VERSION-pebble/build/seid pebble_deb_pkg/usr/local/bin/
+
+              # Create control file
+              printf "Package: seid-pebble\nVersion: ${VERSION#v}\nSection: base\nPriority: optional\nArchitecture: ${GOARCH}\nDepends: libc6 (>= 2.7)\nMaintainer: Alexander-sei <alexander@seifdn.org>\nDescription: Sei Chain binaries (seid with Pebble support)\n" > pebble_deb_pkg/DEBIAN/control
+
+              # Build the .deb package
+              dpkg-deb --build pebble_deb_pkg "seid-pebble-${VERSION}-${GOARCH}.deb"
+
+              # Move the .deb package to temp_binaries
+              mv "seid-pebble-${VERSION}-${GOARCH}.deb" temp_binaries
+
+              # Clean up packaging directory
+              rm -rf pebble_deb_pkg
+            fi
+
+            # Prepare the release
             if gh release view $VERSION &> /dev/null; then
-                echo "Release $VERSION already exists."
+              echo "Release $VERSION already exists."
             else
+              # Try to get release notes from sei-chain repository
+              if gh release view $VERSION --repo sei-protocol/sei-chain &>/dev/null; then
+                # Get the release notes
+                RELEASE_BODY=$(gh release view $VERSION --repo sei-protocol/sei-chain --json body --jq .body)
+                echo "Using release notes from sei-chain repository."
+              else
                 # Try to get tag message as release body
                 RELEASE_BODY=$(git tag -l --format="%(contents)" $VERSION)
                 # If tag message is empty, set default release body
                 if [ -z "$RELEASE_BODY" ]; then
                     RELEASE_BODY="Release $VERSION"
                 fi
-                RELEASE_BODY="${RELEASE_BODY//$'\r'/}"
-                # Update release notes with checksums
-                echo -e "$RELEASE_BODY" > release_body.txt
-                # Append the note about source code archives
-                echo -e "\n\n**Note:** The default 'Source code (zip)' and 'Source code (tar.gz)' archives generated by GitHub are not useful. Please use the attached 'sei-chain-$VERSION.zip' and 'sei-chain-$VERSION.tar.gz' files from the original 'sei-chain' repository." >> release_body.txt
-                # Append the SHA256 Checksums header
-                echo -e "\n\n**SHA256 Checksums:**\n" >> release_body.txt
-                gh release create $VERSION --notes-file release_body.txt
-                # Upload source code archives
-                ZIP_URL="https://github.com/sei-protocol/sei-chain/archive/refs/tags/$VERSION.zip"
-                TAR_GZ_URL="https://github.com/sei-protocol/sei-chain/archive/refs/tags/$VERSION.tar.gz"
-                curl -L -o "sei-chain-$VERSION.zip" "$ZIP_URL"
-                curl -L -o "sei-chain-$VERSION.tar.gz" "$TAR_GZ_URL"
-                gh release upload $VERSION "sei-chain-$VERSION.zip#sei-chain-$VERSION.zip"
-                gh release upload $VERSION "sei-chain-$VERSION.tar.gz#sei-chain-$VERSION.tar.gz"
+                echo "Using local tag message as release body."
+              fi
+              RELEASE_BODY="${RELEASE_BODY//$'\r'/}"
+              # Update release notes with checksums
+              echo -e "$RELEASE_BODY" > release_body.txt
+              # Append the note about source code archives
+              echo -e "\n\n**Note:** The default 'Source code (zip)' and 'Source code (tar.gz)' archives generated by GitHub are not useful. Please use the attached 'sei-chain-$VERSION.zip' and 'sei-chain-$VERSION.tar.gz' files from the original 'sei-chain' repository." >> release_body.txt
+              # Append the SHA256 Checksums header
+              echo -e "\n\n**SHA256 Checksums:**\n" >> release_body.txt
+              gh release create $VERSION --notes-file release_body.txt
+              # Upload source code archives
+              ZIP_URL="https://github.com/sei-protocol/sei-chain/archive/refs/tags/$VERSION.zip"
+              TAR_GZ_URL="https://github.com/sei-protocol/sei-chain/archive/refs/tags/$VERSION.tar.gz"
+              curl -L -o "sei-chain-$VERSION.zip" "$ZIP_URL"
+              curl -L -o "sei-chain-$VERSION.tar.gz" "$TAR_GZ_URL"
+              gh release upload $VERSION "sei-chain-$VERSION.zip#sei-chain-$VERSION.zip"
+              gh release upload $VERSION "sei-chain-$VERSION.tar.gz#sei-chain-$VERSION.tar.gz"
             fi
 
             # Compute checksums and upload binaries
             cd temp_binaries
             for FILE in *; do
-              if [[ "$RUNNER_OS" == "Windows" ]]; then
-                CHECKSUM=$(CertUtil -hashfile "$FILE" SHA256 | findstr /v "hash of file" | findstr /v "CertUtil" | tr -d ' \r\n')
-              elif [[ "$RUNNER_OS" == "macOS" ]]; then
+              if [[ "$RUNNER_OS" == "macOS" ]]; then
                 CHECKSUM=$(shasum -a 256 "$FILE" | awk '{ print $1 }')
               else
                 CHECKSUM=$(sha256sum "$FILE" | awk '{ print $1 }')
@@ -255,7 +295,7 @@ jobs:
             fi
             # Append checksums to release body
             cat "checksum_info.txt" | while read line; do
-                echo "\`\`\`${line}\`\`\`" >> release_body.txt
+              echo "\`\`\`${line}\`\`\`" >> release_body.txt
             done
 
             gh release edit $VERSION --notes-file release_body.txt
