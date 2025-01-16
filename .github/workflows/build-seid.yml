@@ -98,7 +98,7 @@ jobs:
             go mod download
 
             # Find the wasmvm version
-            WASMVM_VERSION=$(go list -m all | grep 'github.com/CosmWasm/wasmvm' | awk '{print $2}')
+            WASMVM_VERSION="v1.5.4"
             echo "Detected wasmvm version: $WASMVM_VERSION"
 
             # Determine the appropriate static libwasmvm binary filename
