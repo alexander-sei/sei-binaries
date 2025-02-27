@@ -1,4 +1,4 @@
-name: Build and Release seid and price-feeder with Pebble
+name: Build and Release seid and price-feeder
 
 on:
   push:
@@ -31,7 +31,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Ensure all tags are fetched
+          fetch-depth: 0  
 
       - name: Authenticate GitHub CLI
         run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
@@ -57,18 +57,23 @@ jobs:
           aarch64-linux-gnu-gcc --version || echo "Unable to execute aarch64-linux-gnu-gcc"
           ls /usr/bin/aarch64-linux-gnu-gcc* || echo "Compiler binaries not found"
 
-      - name: Read Versions
-        id: read_versions
+      - name: Read Version
+        id: read_version
         shell: bash
         run: |
           if [ -f version.txt ]; then
             echo "Using version from version.txt."
-            VERSION=$(cat version.txt | tr '\n' ',')
+            # Check if version.txt contains exactly one line
+            if [ "$(wc -l < version.txt)" -ne 1 ]; then
+              echo "Error: version.txt must contain exactly one version"
+              exit 1
+            fi
+            VERSION=$(cat version.txt)
           else
             echo "Fetching the latest tag from git."
             git fetch --tags
-            LATEST_TAG=$(git describe --tags $(git rev-list --tags --max-count=1))
-            VERSION=$LATEST_TAG
+            LATEST_TAG=$(git describe --tags "$(git rev-list --tags --max-count=1)")
+            VERSION="$LATEST_TAG"
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
@@ -80,13 +85,14 @@ jobs:
         run: |
           set -e
           mkdir -p binaries
-          for VERSION in $(echo "${{ steps.read_versions.outputs.version }}" | tr ',' ' '); do
-            echo "Processing version $VERSION for $GOOS/$GOARCH"
 
-            # Check if release exists
+          VERSION="${{ steps.read_version.outputs.version }}"
+          echo "Processing version $VERSION for $GOOS/$GOARCH"
+
+          # Check if release exists
             if gh release view $VERSION &>/dev/null; then
               echo "Release $VERSION already exists."
-              continue
+              exit 0
             fi
 
             # Clone and checkout the specified version
@@ -98,7 +104,7 @@ jobs:
             go mod download
 
             # Find the wasmvm version
-            WASMVM_VERSION="v1.5.4"
+            WASMVM_VERSION=$(go list -m all | grep 'github.com/CosmWasm/wasmvm' | awk '{print $2}')
             echo "Detected wasmvm version: $WASMVM_VERSION"
 
             # Determine the appropriate static libwasmvm binary filename
@@ -148,8 +154,12 @@ jobs:
             GOOS=$GOOS GOARCH=$GOARCH make build
 
             # Build price-feeder binary
-            echo "Building price-feeder"
-            GOOS=$GOOS GOARCH=$GOARCH go build -o ./build/price-feeder ./oracle/price-feeder
+            if [[ "$GOOS" == "linux" ]] && [[ "$GOARCH" == "amd64" ]]; then
+              echo "Building price-feeder"
+              GOOS=$GOOS GOARCH=$GOARCH go build -o ./build/price-feeder ./oracle/price-feeder
+            else 
+              echo "Not building price-feeder except for Linux amd64"
+            fi
 
             cd ..
 
@@ -157,7 +167,10 @@ jobs:
             mkdir -p temp_binaries
 
             cp "sei-chain-$VERSION/build/seid" "temp_binaries/seid-${VERSION}-${GOOS}-${GOARCH}"
-            cp "sei-chain-$VERSION/build/price-feeder" "temp_binaries/price-feeder-${VERSION}-${GOOS}-${GOARCH}"
+            
+            if [[ "$GOOS" == "linux" ]] && [[ "$GOARCH" == "amd64" ]]; then
+              cp "sei-chain-$VERSION/build/price-feeder" "temp_binaries/price-feeder-${VERSION}-${GOOS}-${GOARCH}"
+            fi
 
             # Build Pebble version of seid
             echo "Building seid (Pebble version)"
@@ -192,22 +205,23 @@ jobs:
 
               # Copy normal seid binary
               cp sei-chain-$VERSION/build/seid deb_pkg/usr/local/bin/
+              # Create symbolic link called 'sei' pointing to 'seid'
+              cd deb_pkg/usr/local/bin
+              ln -s seid sei
+              cd -
 
               # Create control file
-              printf "Package: seid\nVersion: ${VERSION#v}\nSection: base\nPriority: optional\nArchitecture: ${GOARCH}\nDepends: libc6 (>= 2.7)\nMaintainer: Alexander-sei <alexander@seifdn.org>\nDescription: Sei Chain binaries (seid)\n" > deb_pkg/DEBIAN/control
+              printf "Package: sei\nVersion: ${VERSION#v}\nSection: base\nPriority: optional\nArchitecture: ${GOARCH}\nDepends: libc6 (>= 2.7)\nMaintainer: Alexander-sei <alexander@seifdn.org>\nDescription: Sei Chain binaries (seid)\n" > deb_pkg/DEBIAN/control
 
               # Build the .deb package
-              dpkg-deb --build deb_pkg "seid-${VERSION}-${GOARCH}.deb"
+              dpkg-deb --build deb_pkg "sei-${VERSION}-${GOOS}-${GOARCH}.deb"
 
               # Move the .deb package to temp_binaries
-              mv "seid-${VERSION}-${GOARCH}.deb" temp_binaries
+              mv "sei-${VERSION}-${GOOS}-${GOARCH}.deb" temp_binaries
 
               # Clean up packaging directory
               rm -rf deb_pkg
-            fi
 
-            # Package into .deb if on Linux
-            if [[ "$GOOS" == "linux" ]]; then
               echo "Packaging Pebble binaries into .deb package"
 
               # Create package directory structure
@@ -216,15 +230,19 @@ jobs:
 
               # Copy Pebble seid binary
               cp sei-chain-$VERSION-pebble/build/seid pebble_deb_pkg/usr/local/bin/
+              # Create symbolic link for sei pointing to seid
+              cd pebble_deb_pkg/usr/local/bin
+              ln -s seid sei
+              cd -
 
               # Create control file
-              printf "Package: seid-pebble\nVersion: ${VERSION#v}\nSection: base\nPriority: optional\nArchitecture: ${GOARCH}\nDepends: libc6 (>= 2.7)\nMaintainer: Alexander-sei <alexander@seifdn.org>\nDescription: Sei Chain binaries (seid with Pebble support)\n" > pebble_deb_pkg/DEBIAN/control
+              printf "Package: sei-pebble\nVersion: ${VERSION#v}\nSection: base\nPriority: optional\nArchitecture: ${GOARCH}\nDepends: libc6 (>= 2.7)\nMaintainer: Alexander-sei <alexander@seifdn.org>\nDescription: Sei Chain binaries (seid with Pebble support)\n" > pebble_deb_pkg/DEBIAN/control
 
               # Build the .deb package
-              dpkg-deb --build pebble_deb_pkg "seid-pebble-${VERSION}-${GOARCH}.deb"
+              dpkg-deb --build pebble_deb_pkg "sei-pebble-${VERSION}-${GOOS}-${GOARCH}.deb"
 
               # Move the .deb package to temp_binaries
-              mv "seid-pebble-${VERSION}-${GOARCH}.deb" temp_binaries
+              mv "sei-pebble-${VERSION}-${GOOS}-${GOARCH}.deb" temp_binaries
 
               # Clean up packaging directory
               rm -rf pebble_deb_pkg
@@ -268,24 +286,18 @@ jobs:
             # Compute checksums and upload binaries
             cd temp_binaries
             for FILE in *; do
-              if [[ "$RUNNER_OS" == "macOS" ]]; then
-                CHECKSUM=$(shasum -a 256 "$FILE" | awk '{ print $1 }')
-              else
-                CHECKSUM=$(sha256sum "$FILE" | awk '{ print $1 }')
-              fi
-
-              echo "$CHECKSUM  $FILE" > "$FILE.sha256"
+              CHECKSUM=$(shasum -a 256 "$FILE" | awk '{ print $1 }')
               echo "$FILE: $CHECKSUM" >> "../checksum_info.txt"
 
               # Upload binary and checksum to the release
               gh release upload $VERSION "$FILE"
-              gh release upload $VERSION "$FILE.sha256"
             done
 
             cd ..
 
             # Update release notes with checksums
             rm -rf release_body.txt
+
             # Get the current release body
             if RELEASE_BODY=$(gh release view $VERSION --json body --jq .body); then
               echo "$RELEASE_BODY" > release_body.txt
@@ -293,6 +305,7 @@ jobs:
               RELEASE_BODY="Release $VERSION"
               echo "$RELEASE_BODY" > release_body.txt
             fi
+
             # Append checksums to release body
             cat "checksum_info.txt" | while read line; do
               echo "\`\`\`${line}\`\`\`" >> release_body.txt
@@ -301,6 +314,4 @@ jobs:
             gh release edit $VERSION --notes-file release_body.txt
 
             # Clean up temporary files
-            rm -rf sei-chain-$VERSION temp_binaries release_body.txt checksum_info.txt
-
-          done
+            rm -rf sei-chain-$VERSION sei-chain-$VERSION-pebble temp_binaries release_body.txt checksum_info.txt
